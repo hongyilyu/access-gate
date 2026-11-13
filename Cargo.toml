@@ -18,13 +18,15 @@ jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = "1.0.229"
 thiserror = "2.0.21"
-# `Mutex`, held across a key fetch, and the monotonic clock the key cache reads.
-tokio = { version = "1.53.1", features = ["sync", "time"] }
+# `Mutex`, held across a key fetch, the task each fetch runs on, and the monotonic clock the key
+# cache reads.
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]
-# `test-util` for tokio::time::pause, so the key-cache tests move the cache's clock.
-tokio = { version = "1.53.1", features = ["macros", "rt", "test-util"] }
+# `macros` for `#[tokio::test]`, `test-util` for tokio::time::pause, so the key-cache tests move
+# the cache's clock, and `net` and `io-util` for their fake keys endpoint on 127.0.0.1.
+tokio = { version = "1.53.1", features = ["macros", "test-util", "net", "io-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

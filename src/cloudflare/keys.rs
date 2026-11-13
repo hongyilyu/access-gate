@@ -7,14 +7,15 @@ use std::time::Duration;
 use http::StatusCode;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, DecodingKeyKind};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
 /// Where an Access team publishes its signing keys.
 const CERTS: &str = "/cdn-cgi/access/certs";
 
-/// How long fetched keys are trusted: a key the team withdraws stops verifying within it.
+/// How long fetched keys are trusted, from when the request that fetched them was sent: a key
+/// the team withdraws stops verifying within it.
 pub const MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The least time from the end of one fetch to the start of the next. The caller picks the
@@ -28,18 +29,18 @@ const REFETCH_AFTER: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(10);
 const _: () = assert!(TIMEOUT.as_secs() == 10);
 
-/// Whether keys fetched `age` ago are still trusted. The one rule the cache and [`KeysWatch`]
-/// share.
+/// Whether keys `age` old are still trusted. The one rule the cache and [`KeysWatch`] share.
 fn trusted(age: Duration) -> bool {
     age < MAX_AGE
 }
 
-/// The team's keys: fetched when a token first needs one, trusted for [`MAX_AGE`] after the
-/// fetch that got them, and fetched again for a `kid` they lack or once that is up, but never
-/// sooner than [`REFETCH_AFTER`] after the last fetch ended. A fetch that fails or finds no
-/// usable key keeps the keys held, which stay trusted only until their own [`MAX_AGE`] is up.
-/// Both clocks are tokio's monotonic `Instant`, so a wall-clock step cannot cut the floor
-/// short.
+/// The team's keys: fetched when a token first needs one, trusted for [`MAX_AGE`] from when the
+/// fetch that got them sent its request, and fetched again for a `kid` they lack or once that
+/// is up, but never sooner than [`REFETCH_AFTER`] after the last fetch ended. Every fetch runs
+/// to its end, on a task of its own, so a request dropped during one cannot cut the floor short.
+/// A fetch that fails or finds no usable key keeps the keys held, which stay trusted only until
+/// their own [`MAX_AGE`] is up. Both clocks are tokio's monotonic `Instant`, so a wall-clock
+/// step cannot cut the floor short either.
 pub(super) struct TeamKeys {
     certs: Url,
     /// The team's origin, which issues its tokens.
@@ -51,13 +52,15 @@ pub(super) struct TeamKeys {
     /// reads it without holding the cache.
     keys: Arc<RwLock<Option<Keys>>>,
     /// How the last fetch ended. Held across the fetch, so the requests that need its keys
-    /// wait for them rather than fetch their own.
-    last: Mutex<Option<Attempt>>,
+    /// wait for them rather than fetch their own. Behind an `Arc`, so the fetch's own task holds
+    /// the guard.
+    last: Arc<Mutex<Option<Attempt>>>,
 }
 
 struct Keys {
     by_kid: HashMap<String, DecodingKey>,
-    fetched: Instant,
+    /// When the request that fetched them was sent.
+    sent: Instant,
 }
 
 struct Attempt {
@@ -87,7 +90,7 @@ impl TeamKeys {
             http,
             fetched,
             keys: Arc::default(),
-            last: Mutex::default(),
+            last: Arc::default(),
         })
     }
 
@@ -100,44 +103,66 @@ impl TeamKeys {
     }
 
     /// The key named `kid`, or `None` when the team's keys lack it.
-    pub(super) async fn key(&self, kid: &str) -> Result<Option<DecodingKey>, KeysError> {
-        if let Some(key) = self.held(kid) {
-            return Ok(Some(key));
+    pub(super) async fn key(self: &Arc<Self>, kid: &str) -> Result<Option<DecodingKey>, KeysError> {
+        // A request that starts a fetch looks again once the fetch has ended, as one that waited
+        // on it would, so every answer comes from the keys held and the floor.
+        loop {
+            if let Some(key) = self.held(kid) {
+                return Ok(Some(key));
+            }
+            let last = Arc::clone(&self.last).lock_owned().await;
+            // The keys may have been fetched while this request waited.
+            if let Some(key) = self.held(kid) {
+                return Ok(Some(key));
+            }
+            if let Some(attempt) = last.as_ref()
+                && attempt.ended.elapsed() < REFETCH_AFTER
+            {
+                // A fetch that ended so recently and did not fail left keys that are trusted and
+                // lack `kid`.
+                return if attempt.failed {
+                    Err(KeysError::Unavailable)
+                } else {
+                    Ok(None)
+                };
+            }
+            // Spawned, so a request dropped while it waits here still lets the fetch record its
+            // end and store its keys.
+            match tokio::spawn(Arc::clone(self).refresh(last)).await {
+                Ok(refreshed) => refreshed?,
+                // A panic in the fetch, such as one in the `fetched` callback, unwinds this
+                // request as it would if the fetch ran here.
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                // Only a runtime shutting down cancels the task, before its answer was read.
+                Err(_) => return Err(KeysError::Fetch(FetchFailure::Broken)),
+            }
         }
-        let mut last = self.last.lock().await;
-        // The keys may have been fetched while this request waited.
-        if let Some(key) = self.held(kid) {
-            return Ok(Some(key));
-        }
-        if let Some(attempt) = last.as_ref()
-            && attempt.ended.elapsed() < REFETCH_AFTER
-        {
-            // A fetch that ended so recently and did not fail left keys that are trusted and
-            // lack `kid`.
-            return if attempt.failed {
-                Err(KeysError::Unavailable)
-            } else {
-                Ok(None)
-            };
-        }
-        let fetched = self.fetch().await;
-        // Recorded only once the fetch has ended, so a request dropped during it, its client
-        // gone or the process stopping, leaves the next free to fetch.
+    }
+
+    /// One fetch, holding `last` until it returns. It records how the fetch ended and stores the
+    /// keys it found, so a request waiting on `last` sees both, and only then calls `fetched`, so
+    /// a panic there costs neither.
+    async fn refresh(
+        self: Arc<Self>,
+        mut last: OwnedMutexGuard<Option<Attempt>>,
+    ) -> Result<(), KeysError> {
+        let outcome = self.fetch().await;
         *last = Some(Attempt {
             ended: Instant::now(),
-            failed: fetched.is_err(),
+            failed: outcome.is_err(),
         });
-        let keys = fetched?;
-        let key = keys.by_kid.get(kid).cloned();
+        let keys = outcome?;
+        let count = keys.by_kid.len();
         *self.keys.write().unwrap_or_else(PoisonError::into_inner) = Some(keys);
-        Ok(key)
+        (self.fetched)(count);
+        Ok(())
     }
 
     /// The key for `kid` among the keys held, while they are trusted.
     fn held(&self, kid: &str) -> Option<DecodingKey> {
         let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
         let held = keys.as_ref()?;
-        if !trusted(held.fetched.elapsed()) {
+        if !trusted(held.sent.elapsed()) {
             return None;
         }
         held.by_kid.get(kid).cloned()
@@ -148,6 +173,9 @@ impl TeamKeys {
     /// [`KeysError::NoKeys`]. One that does not parse, such as a `kid` that is not a string,
     /// fails the whole set as [`FetchFailure::NotJwks`].
     async fn fetch(&self) -> Result<Keys, KeysError> {
+        // Taken before the request goes out, so a key withdrawn at any time after that stops
+        // verifying within `MAX_AGE` of the withdrawal, however long the answer takes.
+        let sent = Instant::now();
         let set = self.jwks().await.map_err(KeysError::Fetch)?;
         let by_kid: HashMap<_, _> = set
             .keys
@@ -158,11 +186,7 @@ impl TeamKeys {
         if by_kid.is_empty() {
             return Err(KeysError::NoKeys);
         }
-        (self.fetched)(by_kid.len());
-        Ok(Keys {
-            by_kid,
-            fetched: Instant::now(),
-        })
+        Ok(Keys { by_kid, sent })
     }
 
     async fn jwks(&self) -> Result<JwkSet, FetchFailure> {
@@ -246,18 +270,18 @@ pub struct KeysWatch(Arc<RwLock<Option<Keys>>>);
 pub enum KeysState {
     /// No fetch has found keys since the process started.
     NotYet,
-    /// `count` keys, fetched `age` ago and still trusted: `age` is under [`MAX_AGE`].
+    /// `count` keys, `age` old and still trusted: `age` is under [`MAX_AGE`].
     Trusted {
         /// How many keys.
         count: usize,
-        /// How long ago they were fetched.
+        /// How long ago the fetch that got them sent its request.
         age: Duration,
     },
-    /// `count` keys, fetched `age` ago, which is [`MAX_AGE`] or more: no longer trusted.
+    /// `count` keys, `age` old, which is [`MAX_AGE`] or more: no longer trusted.
     Expired {
         /// How many keys.
         count: usize,
-        /// How long ago they were fetched.
+        /// How long ago the fetch that got them sent its request.
         age: Duration,
     },
 }
@@ -270,7 +294,7 @@ impl KeysWatch {
         let Some(keys) = keys.as_ref() else {
             return KeysState::NotYet;
         };
-        let (count, age) = (keys.by_kid.len(), keys.fetched.elapsed());
+        let (count, age) = (keys.by_kid.len(), keys.sent.elapsed());
         if trusted(age) {
             KeysState::Trusted { count, age }
         } else {
@@ -312,12 +336,12 @@ fn verifies_rs256(key: &DecodingKey) -> bool {
 mod tests {
     use super::*;
 
-    /// Two keys as a fetch would leave them, fetched now by tokio's clock.
+    /// Two keys as a fetch would leave them, sent now by tokio's clock.
     fn two_keys() -> Keys {
         let key = || DecodingKey::from_secret(b"not an RSA key; only counted here");
         Keys {
             by_kid: HashMap::from([("k1".to_owned(), key()), ("k2".to_owned(), key())]),
-            fetched: Instant::now(),
+            sent: Instant::now(),
         }
     }
 
@@ -344,5 +368,230 @@ mod tests {
                 age: MAX_AGE
             }
         );
+    }
+
+    /// Fetches from a fake keys endpoint on plain http, which only a build with debug assertions
+    /// may fetch from (`TeamKeys::new`), so a `--release` test run leaves these out.
+    #[cfg(debug_assertions)]
+    mod http_team {
+        use super::*;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::{mpsc, oneshot};
+        use tokio::task::JoinHandle;
+
+        /// The team's keys endpoint as a test plays it, on 127.0.0.1. Each fetch arrives as a
+        /// reply for the test to send, so the test decides when each fetch is answered, and how.
+        struct Cloudflare {
+            url: Url,
+            fetches: mpsc::UnboundedReceiver<oneshot::Sender<String>>,
+        }
+
+        impl Cloudflare {
+            async fn start() -> Cloudflare {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/", listener.local_addr().unwrap());
+                let (arrived, fetches) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while let Ok((socket, _)) = listener.accept().await {
+                        tokio::spawn(serve(socket, arrived.clone()));
+                    }
+                });
+                Cloudflare {
+                    url: Url::parse(&url).unwrap(),
+                    fetches,
+                }
+            }
+
+            /// A cache whose keys are this endpoint's.
+            fn team(&self, fetched: fn(usize)) -> Arc<TeamKeys> {
+                Arc::new(TeamKeys::new(&self.url, fetched).unwrap())
+            }
+
+            /// The next fetch, once it has reached the endpoint, as the reply to send it.
+            async fn fetch(&mut self) -> oneshot::Sender<String> {
+                let next = tokio::time::timeout(Duration::from_secs(5), self.fetches.recv());
+                next.await.expect("a fetch reaches the endpoint").unwrap()
+            }
+
+            /// Whether no fetch has reached the endpoint since the last one taken.
+            fn quiet(&mut self) -> bool {
+                self.fetches.try_recv().is_err()
+            }
+        }
+
+        /// Reads one request's head, hands its reply to the test, and writes what the test sends.
+        async fn serve(
+            mut socket: TcpStream,
+            arrived: mpsc::UnboundedSender<oneshot::Sender<String>>,
+        ) {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => head.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let (reply, answer) = oneshot::channel();
+            if arrived.send(reply).is_ok()
+                && let Ok(response) = answer.await
+            {
+                // The test may have let the request go, and its connection with it.
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        }
+
+        /// A JWKS with one RSA key the RS256 verifier takes per kid. Each modulus is 2048 one
+        /// bits, which is no real key's, but nothing here checks a signature.
+        fn jwks(kids: &[&str]) -> String {
+            let modulus = format!("{}w", "_".repeat(341));
+            let keys: Vec<String> = kids
+                .iter()
+                .map(|kid| format!(r#"{{"kty":"RSA","kid":"{kid}","n":"{modulus}","e":"AQAB"}}"#))
+                .collect();
+            format!(r#"{{"keys":[{}]}}"#, keys.join(","))
+        }
+
+        /// An answer with the keys named `kids`.
+        fn keys(kids: &[&str]) -> String {
+            let body = jwks(kids);
+            let length = body.len();
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n{body}"
+            )
+        }
+
+        /// An answer that is no success.
+        const FAILING: &str =
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+        /// A request for the key `kid`, on a task of its own, as a handler's call is.
+        fn request(team: &Arc<TeamKeys>, kid: &'static str) -> JoinHandle<KeyAnswer> {
+            let team = Arc::clone(team);
+            tokio::spawn(async move { team.key(kid).await })
+        }
+
+        type KeyAnswer = Result<Option<DecodingKey>, KeysError>;
+
+        /// How `request` ends, which it must within 5 seconds.
+        async fn answer(
+            request: JoinHandle<KeyAnswer>,
+        ) -> Result<KeyAnswer, tokio::task::JoinError> {
+            let ended = tokio::time::timeout(Duration::from_secs(5), request);
+            ended.await.expect("the request is answered")
+        }
+
+        /// A request for k1 that starts a fetch and is dropped, as its client going away drops
+        /// it, while the fetch waits for its answer. The fetch's reply.
+        async fn dropped_mid_fetch(
+            team: &Arc<TeamKeys>,
+            cloudflare: &mut Cloudflare,
+        ) -> oneshot::Sender<String> {
+            let first = request(team, "k1");
+            let reply = cloudflare.fetch().await;
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            reply
+        }
+
+        /// Moves tokio's clock, which the cache reads, on by `by`.
+        async fn later(by: Duration) {
+            tokio::time::pause();
+            tokio::time::advance(by).await;
+            tokio::time::resume();
+        }
+
+        #[tokio::test]
+        async fn keys_are_trusted_for_max_age_from_when_their_request_was_sent() {
+            let mut cloudflare = Cloudflare::start().await;
+            let team = cloudflare.team(|_| {});
+            let first = request(&team, "k1");
+            let reply = cloudflare.fetch().await;
+            // The request was sent before it reached the endpoint, so before this.
+            let reached = Instant::now();
+            // Cloudflare answers five seconds, by tokio's clock, after the request reached it.
+            later(Duration::from_secs(5)).await;
+            reply.send(keys(&["k1"])).unwrap();
+            assert!(answer(first).await.unwrap().unwrap().is_some());
+            tokio::time::pause();
+            let since_reached = reached.elapsed();
+            let KeysState::Trusted { age, .. } = team.watch().state() else {
+                panic!("the keys fetched are trusted");
+            };
+            // Both ages are of the one paused instant, so however long the test took to get here,
+            // keys stamped at the answer would be five seconds younger than `since_reached`.
+            assert!(
+                age >= since_reached,
+                "aged from the send: {age:?}, reached {since_reached:?} ago"
+            );
+
+            // Cloudflare withdraws k1. `MAX_AGE` after the request was sent, though not yet after
+            // its answer came, k1 is past trusting, and the keys fetched again lack it.
+            tokio::time::advance(MAX_AGE - age).await;
+            tokio::time::resume();
+            let next = request(&team, "k1");
+            cloudflare.fetch().await.send(keys(&["k2"])).unwrap();
+            assert!(answer(next).await.unwrap().unwrap().is_none());
+            assert!(cloudflare.quiet());
+        }
+
+        #[tokio::test]
+        async fn a_fetch_whose_request_is_dropped_runs_to_its_end_and_holds_off_the_next() {
+            let mut cloudflare = Cloudflare::start().await;
+            let team = cloudflare.team(|_| {});
+            let reply = dropped_mid_fetch(&team, &mut cloudflare).await;
+
+            // The next request waits for that fetch and gets k1 from it, and a kid its keys lack
+            // is refused in the minute after it, with no fetch of its own.
+            let next = request(&team, "k1");
+            reply.send(keys(&["k1"])).unwrap();
+            assert!(answer(next).await.unwrap().unwrap().is_some());
+            let forged = answer(request(&team, "forged")).await.unwrap();
+            assert!(forged.unwrap().is_none());
+            assert!(cloudflare.quiet());
+        }
+
+        #[tokio::test]
+        async fn a_failing_fetch_whose_request_is_dropped_still_holds_off_the_next() {
+            let mut cloudflare = Cloudflare::start().await;
+            let team = cloudflare.team(|_| {});
+            let reply = dropped_mid_fetch(&team, &mut cloudflare).await;
+
+            // The next request waits for that fetch, and in the minute after it is refused as
+            // unavailable, the keys endpoint's fault, with no fetch of its own.
+            let next = request(&team, "k1");
+            reply.send(FAILING.to_owned()).unwrap();
+            let refused = answer(next).await.unwrap();
+            assert_eq!(refused.err(), Some(KeysError::Unavailable));
+            assert!(cloudflare.quiet());
+        }
+
+        #[tokio::test]
+        async fn a_panic_in_the_fetched_callback_reaches_the_request_and_keeps_the_fetch() {
+            let mut cloudflare = Cloudflare::start().await;
+            let team = cloudflare.team(|_| panic!("the app's fetched callback"));
+            let first = request(&team, "k1");
+            cloudflare.fetch().await.send(keys(&["k1"])).unwrap();
+            let panic = answer(first).await.unwrap_err().into_panic();
+            assert_eq!(
+                *panic.downcast::<&str>().unwrap(),
+                "the app's fetched callback"
+            );
+
+            // The fetch was recorded and its keys stored before the callback ran: k1 is served
+            // from them, and a kid they lack is refused in the minute after, with no fetch.
+            assert!(
+                answer(request(&team, "k1"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_some()
+            );
+            let forged = answer(request(&team, "forged")).await.unwrap();
+            assert!(forged.unwrap().is_none());
+            assert!(cloudflare.quiet());
+        }
     }
 }
