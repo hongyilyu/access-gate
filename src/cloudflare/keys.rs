@@ -29,8 +29,7 @@ const REFETCH_AFTER: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(10);
 const _: () = assert!(TIMEOUT.as_secs() == 10);
 
-/// Whether keys fetched `age` ago are still trusted. The one rule the cache and [`KeysWatch`]
-/// share.
+/// Whether keys `age` old are still trusted. The one rule the cache and [`KeysWatch`] share.
 fn trusted(age: Duration) -> bool {
     age < MAX_AGE
 }
@@ -126,9 +125,10 @@ impl TeamKeys {
         }
         // Spawned, so a request dropped while it waits here still lets the fetch record its end
         // and store its keys.
-        let fetch = tokio::spawn(Arc::clone(self).refresh(last, kid.to_owned()));
+        let fetch = tokio::spawn(Arc::clone(self).refresh(last));
         match fetch.await {
-            Ok(key) => key,
+            // The keys are read as held, trust and all, as every other request reads them.
+            Ok(fetched) => fetched.map(|()| self.held(kid)),
             // A panic in the fetch, such as one in the `fetched` callback, unwinds this request
             // as it would if the fetch ran here.
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -137,22 +137,23 @@ impl TeamKeys {
         }
     }
 
-    /// One fetch, holding `last` from the floor check to the record of how the fetch ended: the
-    /// keys it finds replace those held, and it answers with the one named `kid` among them.
+    /// One fetch, holding `last` until it returns. It records how the fetch ended and stores the
+    /// keys it found, so a request waiting on `last` sees both, and only then calls `fetched`, so
+    /// a panic there costs neither.
     async fn refresh(
         self: Arc<Self>,
         mut last: OwnedMutexGuard<Option<Attempt>>,
-        kid: String,
-    ) -> Result<Option<DecodingKey>, KeysError> {
+    ) -> Result<(), KeysError> {
         let fetched = self.fetch().await;
         *last = Some(Attempt {
             ended: Instant::now(),
             failed: fetched.is_err(),
         });
         let keys = fetched?;
-        let key = keys.by_kid.get(&kid).cloned();
+        let count = keys.by_kid.len();
         *self.keys.write().unwrap_or_else(PoisonError::into_inner) = Some(keys);
-        Ok(key)
+        (self.fetched)(count);
+        Ok(())
     }
 
     /// The key for `kid` among the keys held, while they are trusted.
@@ -183,7 +184,6 @@ impl TeamKeys {
         if by_kid.is_empty() {
             return Err(KeysError::NoKeys);
         }
-        (self.fetched)(by_kid.len());
         Ok(Keys { by_kid, sent })
     }
 
@@ -237,7 +237,8 @@ pub enum FetchFailure {
     /// An answer whose body could not be read as a JWKS, whether it is not one or was cut short.
     #[error("an answer that could not be read as a JWKS")]
     NotJwks,
-    /// A request that failed before its answer was read.
+    /// A request that failed before its answer was read, or a fetch whose task the runtime
+    /// stopped as it shut down.
     #[error("a request that failed before its answer was read")]
     Broken,
 }
@@ -334,10 +335,7 @@ fn verifies_rs256(key: &DecodingKey) -> bool {
 mod tests {
     use super::*;
 
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Two keys as a fetch would leave them, fetched now by tokio's clock.
+    /// Two keys as a fetch would leave them, sent now by tokio's clock.
     fn two_keys() -> Keys {
         let key = || DecodingKey::from_secret(b"not an RSA key; only counted here");
         Keys {
@@ -371,109 +369,153 @@ mod tests {
         );
     }
 
-    /// A JWKS with one RSA key the RS256 verifier takes per kid. Each modulus is 2048 one bits,
-    /// which is no real key's, but nothing here checks a signature.
-    fn jwks(kids: &[&str]) -> String {
-        let modulus = format!("{}w", "_".repeat(341));
-        let keys: Vec<String> = kids
-            .iter()
-            .map(|kid| format!(r#"{{"kty":"RSA","kid":"{kid}","n":"{modulus}","e":"AQAB"}}"#))
-            .collect();
-        format!(r#"{{"keys":[{}]}}"#, keys.join(","))
-    }
+    /// Fetches from a fake keys endpoint on plain http, which only a build with debug assertions
+    /// may fetch from (`TeamKeys::new`), so a `--release` test run leaves these out.
+    #[cfg(debug_assertions)]
+    mod http_team {
+        use super::*;
 
-    /// From now on the keys endpoint answers with `response`, and has had no request.
-    async fn answer(cloudflare: &MockServer, response: ResponseTemplate) {
-        cloudflare.reset().await;
-        Mock::given(method("GET"))
-            .and(path(CERTS))
-            .respond_with(response)
-            .mount(cloudflare)
-            .await;
-    }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// From now on the keys endpoint takes `delay` to answer with the keys named `kids`.
-    async fn publish(cloudflare: &MockServer, kids: &[&str], delay: Duration) {
-        let keys = ResponseTemplate::new(200).set_body_raw(jwks(kids), "application/json");
-        answer(cloudflare, keys.set_delay(delay)).await;
-    }
-
-    /// The requests the keys endpoint has had since it last changed.
-    async fn fetches(cloudflare: &MockServer) -> usize {
-        cloudflare.received_requests().await.unwrap().len()
-    }
-
-    fn team_at(cloudflare: &MockServer) -> Arc<TeamKeys> {
-        let url = Url::parse(&cloudflare.uri()).unwrap();
-        Arc::new(TeamKeys::new(&url, |_| {}).unwrap())
-    }
-
-    /// Moves tokio's clock, which the cache reads, on by `by`.
-    async fn later(by: Duration) {
-        tokio::time::pause();
-        tokio::time::advance(by).await;
-        tokio::time::resume();
-    }
-
-    /// A request for k1 that starts a fetch and is dropped, as its client going away drops it,
-    /// once the fetch has reached `cloudflare`.
-    async fn dropped_mid_fetch(team: &Arc<TeamKeys>, cloudflare: &MockServer) {
-        let request = tokio::spawn({
-            let team = Arc::clone(team);
-            async move { team.key("k1").await }
-        });
-        while fetches(cloudflare).await == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        /// A JWKS with one RSA key the RS256 verifier takes per kid. Each modulus is 2048 one
+        /// bits, which is no real key's, but nothing here checks a signature.
+        fn jwks(kids: &[&str]) -> String {
+            let modulus = format!("{}w", "_".repeat(341));
+            let keys: Vec<String> = kids
+                .iter()
+                .map(|kid| format!(r#"{{"kty":"RSA","kid":"{kid}","n":"{modulus}","e":"AQAB"}}"#))
+                .collect();
+            format!(r#"{{"keys":[{}]}}"#, keys.join(","))
         }
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-    }
 
-    #[tokio::test]
-    async fn keys_are_trusted_for_max_age_from_when_their_request_was_sent() {
-        let cloudflare = MockServer::start().await;
-        publish(&cloudflare, &["k1"], Duration::from_secs(1)).await;
-        let team = team_at(&cloudflare);
-        assert!(team.key("k1").await.unwrap().is_some());
-        let KeysState::Trusted { age, .. } = team.watch().state() else {
-            panic!("the keys fetched are trusted");
-        };
-        assert!(age >= Duration::from_secs(1), "aged from the send: {age:?}");
+        /// From now on the keys endpoint answers with `response`, and has had no request.
+        async fn answer(cloudflare: &MockServer, response: ResponseTemplate) {
+            cloudflare.reset().await;
+            Mock::given(method("GET"))
+                .and(path(CERTS))
+                .respond_with(response)
+                .mount(cloudflare)
+                .await;
+        }
 
-        // Cloudflare withdraws k1. A second short of `MAX_AGE` after its answer came, which is at
-        // least `MAX_AGE` after the request was sent, k1 is past trusting, and the keys fetched
-        // again lack it.
-        publish(&cloudflare, &["k2"], Duration::ZERO).await;
-        later(MAX_AGE - Duration::from_secs(1)).await;
-        assert!(team.key("k1").await.unwrap().is_none());
-        assert_eq!(fetches(&cloudflare).await, 1);
-    }
+        /// From now on the keys endpoint takes `delay` to answer with the keys named `kids`.
+        async fn publish(cloudflare: &MockServer, kids: &[&str], delay: Duration) {
+            let keys = ResponseTemplate::new(200).set_body_raw(jwks(kids), "application/json");
+            answer(cloudflare, keys.set_delay(delay)).await;
+        }
 
-    #[tokio::test]
-    async fn a_fetch_whose_request_is_dropped_runs_to_its_end_and_holds_off_the_next() {
-        let cloudflare = MockServer::start().await;
-        publish(&cloudflare, &["k1"], Duration::from_secs(1)).await;
-        let team = team_at(&cloudflare);
-        dropped_mid_fetch(&team, &cloudflare).await;
+        /// The requests the keys endpoint has had since it last changed.
+        async fn fetches(cloudflare: &MockServer) -> usize {
+            cloudflare.received_requests().await.unwrap().len()
+        }
 
-        // The next request waits for that fetch and gets k1 from it, and a kid its keys lack is
-        // refused in the minute after it with no fetch of its own.
-        assert!(team.key("k1").await.unwrap().is_some());
-        assert!(team.key("forged").await.unwrap().is_none());
-        assert_eq!(fetches(&cloudflare).await, 1);
-    }
+        fn team_at(cloudflare: &MockServer, fetched: fn(usize)) -> Arc<TeamKeys> {
+            let url = Url::parse(&cloudflare.uri()).unwrap();
+            Arc::new(TeamKeys::new(&url, fetched).unwrap())
+        }
 
-    #[tokio::test]
-    async fn a_failing_fetch_whose_request_is_dropped_still_holds_off_the_next() {
-        let cloudflare = MockServer::start().await;
-        let failing = ResponseTemplate::new(500).set_delay(Duration::from_secs(1));
-        answer(&cloudflare, failing).await;
-        let team = team_at(&cloudflare);
-        dropped_mid_fetch(&team, &cloudflare).await;
+        /// How long the keys endpoint takes to answer in the tests that drop a request while it
+        /// waits: long enough that the request is still waiting when it is dropped.
+        const SLOW: Duration = Duration::from_secs(3);
 
-        // The next request waits for that fetch, and in the minute after it is refused as
-        // unavailable, the keys endpoint's fault, with no fetch of its own.
-        assert_eq!(team.key("k1").await.err(), Some(KeysError::Unavailable));
-        assert_eq!(fetches(&cloudflare).await, 1);
+        /// A request for k1 that starts a fetch and is dropped, as its client going away drops
+        /// it, once the fetch has reached `cloudflare` and before its answer comes.
+        async fn dropped_mid_fetch(team: &Arc<TeamKeys>, cloudflare: &MockServer) {
+            let request = tokio::spawn({
+                let team = Arc::clone(team);
+                async move { team.key("k1").await }
+            });
+            let reached = async {
+                while fetches(cloudflare).await == 0 {
+                    assert!(!request.is_finished(), "the request ended without a fetch");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), reached)
+                .await
+                .expect("the request reaches the keys endpoint");
+            request.abort();
+            assert!(
+                request.await.unwrap_err().is_cancelled(),
+                "dropped while its fetch waited"
+            );
+        }
+
+        #[tokio::test]
+        async fn keys_are_trusted_for_max_age_from_when_their_request_was_sent() {
+            let cloudflare = MockServer::start().await;
+            publish(&cloudflare, &["k1"], Duration::from_secs(1)).await;
+            let team = team_at(&cloudflare, |_| {});
+            let asked = Instant::now();
+            assert!(team.key("k1").await.unwrap().is_some());
+            // Cloudflare withdraws k1. Then tokio's clock stops, so the ages below are of one
+            // instant: the keys' age counts from the request, not from the answer a second later.
+            publish(&cloudflare, &["k2"], Duration::ZERO).await;
+            tokio::time::pause();
+            let since_asked = asked.elapsed();
+            let KeysState::Trusted { age, .. } = team.watch().state() else {
+                panic!("the keys fetched are trusted");
+            };
+            assert!(
+                since_asked >= Duration::from_secs(1),
+                "the answer took its second"
+            );
+            assert!(
+                since_asked - age < Duration::from_millis(500),
+                "aged from the send: {age:?}, asked {since_asked:?} ago"
+            );
+
+            // `MAX_AGE` after the request was sent, though not yet after its answer came, k1 is
+            // past trusting, and the keys fetched again lack it.
+            tokio::time::advance(MAX_AGE - age).await;
+            tokio::time::resume();
+            assert!(team.key("k1").await.unwrap().is_none());
+            assert_eq!(fetches(&cloudflare).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_fetch_whose_request_is_dropped_runs_to_its_end_and_holds_off_the_next() {
+            let cloudflare = MockServer::start().await;
+            publish(&cloudflare, &["k1"], SLOW).await;
+            let team = team_at(&cloudflare, |_| {});
+            dropped_mid_fetch(&team, &cloudflare).await;
+
+            // The next request waits for that fetch and gets k1 from it, and a kid its keys lack
+            // is refused in the minute after it with no fetch of its own.
+            assert!(team.key("k1").await.unwrap().is_some());
+            assert!(team.key("forged").await.unwrap().is_none());
+            assert_eq!(fetches(&cloudflare).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_failing_fetch_whose_request_is_dropped_still_holds_off_the_next() {
+            let cloudflare = MockServer::start().await;
+            answer(&cloudflare, ResponseTemplate::new(500).set_delay(SLOW)).await;
+            let team = team_at(&cloudflare, |_| {});
+            dropped_mid_fetch(&team, &cloudflare).await;
+
+            // The next request waits for that fetch, and in the minute after it is refused as
+            // unavailable, the keys endpoint's fault, with no fetch of its own.
+            assert_eq!(team.key("k1").await.err(), Some(KeysError::Unavailable));
+            assert_eq!(fetches(&cloudflare).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_panic_in_the_fetched_callback_reaches_the_request_and_keeps_the_fetch() {
+            let cloudflare = MockServer::start().await;
+            publish(&cloudflare, &["k1"], Duration::ZERO).await;
+            let team = team_at(&cloudflare, |_| panic!("the app's fetched callback"));
+            let request = tokio::spawn({
+                let team = Arc::clone(&team);
+                async move { team.key("k1").await }
+            });
+            assert!(request.await.unwrap_err().is_panic(), "the request panics");
+
+            // The fetch was recorded and its keys stored before the callback ran, so the next
+            // request is served from them, with no fetch of its own.
+            assert!(team.key("k1").await.unwrap().is_some());
+            assert_eq!(fetches(&cloudflare).await, 1);
+        }
     }
 }

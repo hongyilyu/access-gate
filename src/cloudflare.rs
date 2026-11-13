@@ -52,7 +52,9 @@ pub struct Team(Arc<TeamKeys>);
 impl Team {
     /// The team at `url` (`https://{team}.cloudflareaccess.com/`), whose tokens are issued by
     /// its origin and whose keys are at `/cdn-cgi/access/certs` under it. Each fetch that finds
-    /// keys calls `fetched` with how many. Fetches nothing yet.
+    /// keys calls `fetched` with how many, once it has stored them. A fetch runs on a task of its
+    /// own, which can outlive the request that started it, so `fetched` sees none of that
+    /// request's span or task-locals. Fetches nothing yet.
     ///
     /// The keys come only from `url` with its path replaced: no redirect is followed and no
     /// proxy is taken from the environment, so the URL alone decides where they come from. In a

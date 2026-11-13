@@ -24,8 +24,9 @@ tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]
-# `test-util` for tokio::time::pause, so the key-cache tests move the cache's clock.
-tokio = { version = "1.53.1", features = ["macros", "rt", "test-util"] }
+# `macros` for `#[tokio::test]`, and `test-util` for tokio::time::pause, so the key-cache tests
+# move the cache's clock.
+tokio = { version = "1.53.1", features = ["macros", "test-util"] }
 # A fake keys endpoint on 127.0.0.1, so the key-cache tests run real fetches.
 wiremock = "0.6.5"
 
