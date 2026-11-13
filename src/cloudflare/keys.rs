@@ -509,15 +509,23 @@ mod tests {
             let team = cloudflare.team(|_| {});
             let first = request(&team, "k1");
             let reply = cloudflare.fetch().await;
-            // Cloudflare answers five seconds, by tokio's clock, after the request went out.
+            // The request was sent before it reached the endpoint, so before this.
+            let reached = Instant::now();
+            // Cloudflare answers five seconds, by tokio's clock, after the request reached it.
             later(Duration::from_secs(5)).await;
             reply.send(keys(&["k1"])).unwrap();
             assert!(answer(first).await.unwrap().unwrap().is_some());
             tokio::time::pause();
+            let since_reached = reached.elapsed();
             let KeysState::Trusted { age, .. } = team.watch().state() else {
                 panic!("the keys fetched are trusted");
             };
-            assert!(age >= Duration::from_secs(5), "aged from the send: {age:?}");
+            // Both ages are of the one paused instant, so however long the test took to get here,
+            // keys stamped at the answer would be five seconds younger than `since_reached`.
+            assert!(
+                age >= since_reached,
+                "aged from the send: {age:?}, reached {since_reached:?} ago"
+            );
 
             // Cloudflare withdraws k1. `MAX_AGE` after the request was sent, though not yet after
             // its answer came, k1 is past trusting, and the keys fetched again lack it.
